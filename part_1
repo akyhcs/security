@@ -1,0 +1,83 @@
+OAuth 2.0 client type refers to the classification of applications (clients) that interact with an OAuth 2.0 authorization server to obtain access tokens. The client type helps determine how credentials are handled and the level of trust the authorization server places in the client. The two main client types defined by the OAuth 2.0 specification are:
+1. Confidential Client
+•	Definition: Clients that are capable of maintaining the confidentiality of their credentials (client secrets).
+•	Examples: Web applications running on a secure backend server, where the client secret can be stored safely.
+•	Characteristic: They authenticate with the authorization server using a client secret.
+2. Public Client
+•	Definition: Clients that cannot securely store credentials.
+•	Examples: Single-page applications (SPA), mobile apps, desktop apps, or any client running on a user’s device.
+•	Characteristic: They do not authenticate with a client secret, since any secret embedded in the application can be easily extracted.
+•	Summary Table:
+Client Type	Can Keep Secret?	Example Applications	Authentication with Client Secret?
+Confidential	Yes	Backend Web Servers	Yes
+Public	No	Mobile Apps, SPAs, Desktop Apps	No
+
+An authorization server is a core component in the OAuth 2.0 and OpenID Connect protocols. It is a server responsible for authenticating users, obtaining their consent, and issuing access tokens to client applications so they can access protected resources
+
+Key Functions of an Authorization Server:
+•	Authenticate Users: Verifies user identity (e.g., via username/password, SSO, MFA).
+•	Obtain User Consent: Asks the user to allow or deny access for the client application.
+•	Issue Tokens: Generates and returns access tokens, refresh tokens, and sometimes ID tokens to the client.
+•	Validate Scopes & Permissions: Ensures that the client only receives the permissions (scopes) the user approved.
+Authorization Server vs. Resource Server
+•	Authorization Server: Handles authentication, authorization, and token issuance.
+•	Resource Server: Hosts the protected resources (APIs, data) and validates tokens received from clients.
+Example
+In OAuth 2.0, when you sign in to a third-party app with Google, Google’s OAuth server is the authorization server. It asks you to log in and consent to share data, then issues an access token to the app.
+[Client App] <--requests token-- [Authorization Server] <--authenticates user & gets consent-- [User]
+
+An OAuth access token is a credential used by client applications to access protected resources on a server after a user has authorized the client. The access token is issued by the authorization server and is typically a string (often a JWT or opaque string) that represents the authorization granted to the client.
+
+Key Points about OAuth Access Tokens:
+Purpose: Allows the client (app) to make API calls on behalf of the user.
+Scope: Limits what the client can do; defined by the permissions (scopes) granted during authorization.
+Lifetime: Usually short-lived (minutes to hours). After expiry, a new token must be obtained (often using a refresh token).
+Format: Can be opaque (just a random string) or structured (e.g., JWT with claims).
+Security: Should be kept confidential. Never expose access tokens in logs, URLs, or public places.
+How It Works:
+User Authorizes the Client: The user logs in and grants permission for the app to access their data.
+Client Requests Access Token: The client exchanges an authorization code or credentials with the authorization server.
+Authorization Server Issues Access Token: If everything is valid, the server returns an access token to the client.
+Client Uses Access Token: The client sends the access token with API requests to the resource server.
+Resource Server Validates Token: The server checks the token and, if valid, allows access to the protected resources.
+Example (HTTP request with Bearer token):
+HTTP
+GET /userinfo
+Host: api.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6...
+Related Concepts:
+Refresh Token: Used to obtain a new access token after the old one expires.
+ID Token: (in OpenID Connect) Contains identity information about the user.
+
+Access tokens in OAuth and related protocols can come in different types, mainly distinguished by their format and intended usage. Here are the primary types of access tokens you’ll encounter:
+
+1. Opaque Tokens
+Description: A random string with no inherent meaning to the client or resource server.
+Usage: The resource server must validate the token by sending it to the authorization server (introspection endpoint).
+Example: 2YotnFZFEjr1zCsicMWpAA
+2. JWT (JSON Web Token)
+Description: A token that contains readable claims/data, digitally signed and sometimes encrypted.
+Usage: The resource server can validate and extract information from the token itself (such as user, scopes, expiry).
+Example:
+Code
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Components: Header, Payload (claims), Signature.
+3. Reference Tokens
+Description: Similar to opaque tokens, these are pointers/reference IDs to a record stored on the authorization server.
+Usage: The authorization server must be consulted to retrieve token metadata.
+4. Bearer Tokens
+Description: Most access tokens are bearer tokens, meaning anyone possessing the token can use it to access resources.
+Usage: Sent in the Authorization: Bearer <token> header. Both opaque and JWT tokens can be bearer tokens.
+5. Proof-of-Possession Tokens
+Description: These require the client to prove possession of a cryptographic key when using the token.
+Usage: More secure, but less common in most OAuth implementations.
+Summary Table
+Type	Format	Validation Method	Example Use Case
+Opaque	Random String	Introspection	Standard OAuth
+JWT	Structured Token	Local Validation	OpenID, APIs
+Reference	ID/Pointer	Introspection	Custom deployments
+Bearer	Any (common: JWT)	Header	Most OAuth flows
+Proof-of-Possession	Structured Token	Key Proof	High-security systems
+
+
+
