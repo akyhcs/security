@@ -1,0 +1,591 @@
+Got it — here’s a crisp, comprehensive manual test suite you can run against your Spring Boot “DB → System B with Mongo mapping + incremental sync” flow.
+
+I’ll use these terms so the steps are unambiguous:
+
+DB: source table with columns id (PK), last_updated_at (ts), payload…
+
+System B: external API with Create and Update endpoints returning system_b_id
+
+Mongo Mapping: collection storing { db_record_id, system_b_id, last_synced_at }
+
+Control Store: where app persists last_success_run_at (the watermark)
+
+Batch Size: app’s page size for reading/sending (if applicable)
+
+
+
+---
+
+Positive Test Cases (Happy Paths)
+
+P1. First run (no watermark) → full-load create
+
+Pre: Control Store has no last_success_run_at. Mongo is empty. DB has 5 records with valid data.
+
+Steps: Trigger job.
+
+Expect:
+
+App reads all 5 records.
+
+Classifies all as Create (no Mongo hits).
+
+Calls System B Create 5×; each response includes system_b_id.
+
+Mongo stores 5 mappings with correct db_record_id ↔ system_b_id and last_synced_at.
+
+last_success_run_at is set to the job end time.
+
+
+
+P2. Second run (incremental) with one updated row
+
+Pre: From P1 state. Update DB.id=3 with newer last_updated_at.
+
+Steps: Trigger job.
+
+Expect:
+
+Only id=3 is picked (filter last_updated_at > last_success_run_at).
+
+Mongo lookup finds id=3 → Update list.
+
+Calls System B Update for id=3.
+
+Mongo last_synced_at for id=3 refreshed.
+
+last_success_run_at advanced.
+
+
+
+P3. Second run (incremental) with one new row
+
+Pre: Insert DB.id=6 with last_updated_at > watermark. No Mongo mapping for 6.
+
+Steps: Trigger job.
+
+Expect:
+
+Only id=6 picked.
+
+Mongo miss → Create list.
+
+System B Create called once; mapping inserted.
+
+
+
+P4. Mixed create/update same run
+
+Pre: One new row (create) and one modified old row (update), both beyond watermark.
+
+Steps: Trigger job.
+
+Expect:
+
+Two lists built correctly (1 Create, 1 Update).
+
+Corresponding API calls made to the right endpoints.
+
+Mongo inserts/updates as appropriate.
+
+Watermark advanced once at end.
+
+
+
+P5. Idempotent re-run after full success
+
+Pre: No DB changes since last success.
+
+Steps: Trigger job again.
+
+Expect:
+
+Zero rows selected (incremental filter works).
+
+No System B calls.
+
+Watermark may remain same or advance trivially with no side effects.
+
+
+
+P6. Batching/pagination respected
+
+Pre: 120 DB rows; Batch Size = 50; first run scenario.
+
+Steps: Trigger job.
+
+Expect:
+
+3 read pages (50, 50, 20).
+
+All 120 processed; no duplicates; Mongo ends with 120 mappings; watermark set.
+
+
+
+P7. Timezone handling (UTC in DB, app in IST)
+
+Pre: Watermark at 2025-09-25 18:30 UTC (= 2025-09-26 00:00 IST). Update one row at 2025-09-25 19:00 UTC.
+
+Steps: Trigger job.
+
+Expect: Row is included (correct cross-TZ comparison).
+
+
+P8. Response parsing
+
+Pre: System B returns payload with system_b_id, status=success.
+
+Steps: Run creates/updates.
+
+Expect: App extracts system_b_id correctly and writes Mongo.
+
+
+P9. Partial batch success with internal retry within the same run
+
+Pre: Configure System B to transiently fail one call once, succeed on retry.
+
+Steps: Trigger job.
+
+Expect:
+
+Failed call retried per policy; succeeds.
+
+No duplicates in Mongo; single mapping per DB id.
+
+Watermark reflects overall success.
+
+
+
+P10. Controlled concurrency
+
+Pre: Enable parallel sender threads (e.g., 5). 20 items to send.
+
+Steps: Trigger job.
+
+Expect:
+
+No race conditions: each DB id produces at most one System B request of each type.
+
+Mongo upserts are consistent (no duplicate docs).
+
+
+
+P11. Update with unchanged payload (no-op)
+
+Pre: Record’s payload unchanged but last_updated_at moved (e.g., audit touch).
+
+Steps: Trigger job.
+
+Expect:
+
+Still qualifies (timestamp strictly greater than watermark).
+
+System B Update invoked; 200 OK; Mongo last_synced_at refreshed.
+
+
+
+P12. Create followed by immediate update in same cycle is prevented
+
+Pre: New row qualifies; business logic prevents double-send.
+
+Steps: Trigger job.
+
+Expect: One Create only; app does not misclassify as Update later in the same run.
+
+
+P13. Control Store durability
+
+Pre: Simulate app crash after all sends but before watermark persist.
+
+Steps: Restart job.
+
+Expect:
+
+Safe re-processing of the last batch or whole run without duplicates in System B (idempotency keys or dedupe),
+
+Watermark written at end of completed run.
+
+
+
+P14. Reconcile verification
+
+Pre: After a successful run, query Mongo and DB counts.
+
+Steps: Compare counts for records processed this run.
+
+Expect: Counts match; spot-check random mappings for correct system_b_id.
+
+
+P15. Field validation before send
+
+Pre: All selected DB rows have required fields non-null per contract.
+
+Steps: Trigger job.
+
+Expect: Validation passes; API calls proceed.
+
+
+
+---
+
+Negative / Edge Test Cases (Unhappy Paths)
+
+N1. System B Create returns 500
+
+Pre: Force System B Create to return 500 for a subset.
+
+Steps: Trigger job.
+
+Expect:
+
+Retries as per policy (e.g., exponential backoff).
+
+If still failing, app marks those as failed and does not persist watermark (or persists a partial watermark only if design supports checkpointing without data loss).
+
+Clear failure report/log.
+
+
+
+N2. System B Update returns 404 (unknown system_b_id)
+
+Pre: Corrupt one Mongo mapping to an invalid system_b_id.
+
+Steps: Trigger job; record qualifies for update.
+
+Expect:
+
+App handles 404 gracefully: either (a) falls back to Create, or (b) flags for manual remediation.
+
+No silent success; detailed error saved.
+
+
+
+N3. System B returns 200 but missing system_b_id
+
+Pre: Mock API response without system_b_id.
+
+Steps: Run create.
+
+Expect:
+
+App treats as failure and does not write Mongo mapping.
+
+Watermark not advanced; error surfaced.
+
+
+
+N4. Network timeout
+
+Pre: Induce timeout on API calls.
+
+Steps: Trigger job.
+
+Expect:
+
+Retry according to policy; eventual failure recorded if retries exhausted.
+
+No duplicate downstream creates after restart (idempotency).
+
+
+
+N5. Auth failure (401) to System B
+
+Pre: Provide invalid token.
+
+Steps: Trigger job.
+
+Expect:
+
+Job aborts early; no watermark update; actionable error log.
+
+
+
+N6. Mongo unavailable during write
+
+Pre: Stop Mongo after API calls succeed.
+
+Steps: Trigger job.
+
+Expect:
+
+App fails cleanly; watermark not advanced (to avoid losing the mapping state).
+
+On next run, safe re-send behavior (idempotency).
+
+
+
+N7. Control Store unavailable
+
+Pre: Make watermark store read-only or down.
+
+Steps: Trigger job.
+
+Expect:
+
+App refuses to run or runs but does not advance watermark; reports failure.
+
+
+
+N8. DB clock skew vs app clock
+
+Pre: Set DB last_updated_at barely equal to watermark boundary.
+
+Steps: Trigger job.
+
+Expect:
+
+Use strict > comparison; equal timestamps are excluded.
+
+Document behavior in logs.
+
+
+
+N9. Invalid/dirty data (required field null)
+
+Pre: Row qualifies by timestamp but has null in a required field.
+
+Steps: Trigger job.
+
+Expect:
+
+Validation failure → row skipped with error; others proceed.
+
+Watermark strategy ensures you won’t permanently skip (e.g., keep failing rows retried next run or recorded to a DLQ list).
+
+
+
+N10. Duplicate DB primary keys in the read window
+
+Pre: Simulate a bad view returning the same id twice.
+
+Steps: Trigger job.
+
+Expect:
+
+App deduplicates within run.
+
+Only one API call per id.
+
+
+
+N11. Concurrent job runs (overlap)
+
+Pre: Start job twice concurrently.
+
+Steps: Observe behavior.
+
+Expect:
+
+Mutual exclusion/lock in place; second run aborted or queued.
+
+No double-sends; watermark integrity preserved.
+
+
+
+N12. Oversized payload
+
+Pre: One record exceeds System B payload limits.
+
+Steps: Trigger job.
+
+Expect:
+
+App splits/rejects with clear error; other records proceed.
+
+No watermark advancement if policy requires all-or-nothing (or partial checkpointing if supported).
+
+
+
+N13. Rate limiting (429) from System B
+
+Pre: Force 429 with Retry-After.
+
+Steps: Trigger job.
+
+Expect:
+
+Backoff respects Retry-After; resumes successfully; maintains order where required.
+
+
+
+N14. Create/Update endpoint mismatch
+
+Pre: Force mapping exists but app accidentally calls Create.
+
+Steps: Run and inspect.
+
+Expect:
+
+System B rejects duplicate; app logs and corrects next attempt to Update; no new Mongo doc created.
+
+
+
+N15. Watermark advanced despite partial failures (data loss check)
+
+Pre: Half the batch fails after some successes.
+
+Steps: Trigger job.
+
+Expect:
+
+Watermark not advanced past failing records if that would cause missed reprocessing.
+
+If per-record checkpointing exists, verify it’s safe and documented.
+
+
+
+N16. Mongo mapping missing for an item previously created
+
+Pre: Delete one Mongo doc; DB last_updated_at unchanged (so it won’t be picked by incremental).
+
+Steps: Trigger job.
+
+Expect:
+
+Record is not selected (since no new update), which is correct; run a reconciliation test (separate job) to detect mapping drift.
+
+
+
+N17. Out-of-order updates
+
+Pre: Two updates for the same id close together; second finishes first due to concurrency.
+
+Steps: Trigger job.
+
+Expect:
+
+Final System B state equals the latest DB update; app ensures monotonic updates (e.g., compare timestamps before sending).
+
+
+
+N18. Delete in DB (if applicable)
+
+Pre: One record is hard-deleted in DB.
+
+Steps: Trigger job.
+
+Expect:
+
+No action unless you support delete propagation.
+
+If supported, verify System B Delete and Mongo cleanup occur only per explicit design.
+
+
+
+N19. Response schema change
+
+Pre: System B adds unknown fields; system_b_id still present.
+
+Steps: Trigger job.
+
+Expect:
+
+Parser ignores extra fields; still succeeds.
+
+
+
+N20. Malformed JSON from System B
+
+Pre: Return invalid JSON.
+
+Steps: Trigger job.
+
+Expect:
+
+App handles parse error, retries; on persistent failure, logs and does not advance watermark.
+
+
+
+N21. Large run crossing midnight/watermark boundary
+
+Pre: Long run; some records updated while the job is still processing earlier pages.
+
+Steps: Trigger job.
+
+Expect:
+
+Watermark is based on job start or max processed timestamp, per design. Validate no records are skipped in the next run.
+
+
+
+N22. Duplicate Mongo entries prevented
+
+Pre: Mongo already has a mapping; Create path gets called due to a bug.
+
+Steps: Trigger job.
+
+Expect:
+
+Unique index on db_record_id prevents duplicates; app surfaces error; run does not corrupt state.
+
+
+
+N23. Recovery after app crash mid-run
+
+Pre: Crash after page 1 committed to Mongo; page 2 not started.
+
+Steps: Restart job.
+
+Expect:
+
+Re-selection logic does not re-process page 1 if idempotency keys exist; otherwise safe duplicate handling in System B; watermark ultimately consistent.
+
+
+
+N24. Strict vs inclusive comparison
+
+Pre: Update a record at exactly the previous last_success_run_at.
+
+Steps: Trigger job.
+
+Expect:
+
+Record excluded (strict >); add a separate test verifying documentation clarifies this.
+
+
+
+N25. Validation error bubbles up to result/report
+
+Pre: One bad record in 100.
+
+Steps: Run job.
+
+Expect:
+
+Job summary shows: processed=99, failed=1, with error reasons and actionable IDs.
+
+
+
+
+---
+
+Test Data & Setup Hints
+
+Create a minimal DB fixture with a few records and controllable last_updated_at.
+
+Ensure Mongo has a unique index on db_record_id.
+
+Make System B mockable (e.g., via WireMock or a toggle) so you can force 200/400/401/404/429/500, timeouts, and malformed bodies.
+
+Log and expose a run summary: selected count, creates, updates, successes, failures, retries, and the final last_success_run_at.
+
+
+What to Record in Each Test Case
+
+For your test sheet / Zephyr / TestRail, keep columns like:
+
+ID (e.g., P1 / N5)
+
+Title
+
+Preconditions (DB rows, Mongo state, watermark value, mock API behavior)
+
+Steps
+
+Expected Results (including Mongo contents, System B calls made, and watermark outcome)
+
+Evidence (log lines, API call captures, Mongo/DB queries, run summary screenshot)
+
+
+If you want, I can drop these into a ready-to-import CSV or a neatly formatted Google Sheet layout.
+
